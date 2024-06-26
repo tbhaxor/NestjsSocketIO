@@ -37,10 +37,14 @@ export class GameGateway implements OnGatewayConnection {
     @ConnectedSocket() socket: Socket,
   ) {
     const game = this.gameService.getGameById(body.gameId);
-    if (game.currentPlayer != socket.id) {
-      throw new BadRequestException(['Please wait for your turn.']);
-    } else if (game.isEnded) {
+    if (game.isEnded) {
       throw new BadRequestException(['Game is already ended.']);
+    }
+
+    if (game.players.length < 2) {
+      throw new BadRequestException(['Please wait for your opponent to join.']);
+    } else if (game.currentPlayer != socket.id) {
+      throw new BadRequestException(['Please wait for your turn.']);
     }
     const maze = game.maze.find((v) => v.colId == body.colId && v.rowId == body.rowId);
 
@@ -57,7 +61,7 @@ export class GameGateway implements OnGatewayConnection {
 
   async handleConnection(socket: Socket) {
     this.logger.log(`Player ${socket.id} tried connection from ${socket.conn.remoteAddress}`);
-    const isNew = typeof socket.handshake.query['gameId'] === 'undefined';
+    const isNew = !socket.handshake.query['gameId'];
     const gameId = (isNew && this.gameService.createGame(socket.id)) || <string>socket.handshake.query['gameId'];
     let game: GameDto;
     try {
@@ -72,16 +76,24 @@ export class GameGateway implements OnGatewayConnection {
       return socket.disconnect(true);
     }
 
+    await socket.join(gameId);
     if (isNew) {
-      await socket.join(gameId);
       socket.emit('gameCreated', { gameId });
     } else {
       this.gameService.joinToGame(gameId, socket.id);
-      await socket.join(gameId);
     }
 
     this.logger.log(`Player ${socket.id} joined the game ${gameId}`);
     this.io.to(gameId).emit('gameJoined', { playerId: socket.id });
     this.io.to(gameId).emit('gameTurn', { playerId: game.currentPlayer });
+  }
+
+  async closeAllSockets() {
+    if (process.env.NODE_ENV === 'test') {
+      const sockets = await this.io.fetchSockets();
+      for (const socket of sockets) {
+        socket.disconnect(true);
+      }
+    }
   }
 }
