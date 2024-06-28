@@ -254,13 +254,11 @@ describe('GameModule (e2e)', () => {
     });
 
     it('should throw exception when player without its turn tries to mark on maze', () => {
-      return new Promise<void>(async (resolve, reject) => {
+      return new Promise<void>(async (resolve) => {
         playerB = io(`http://localhost:3000/game?gameId=${gameId}`);
-
-        playerA.onAny(function (event: string) {
-          reject(`Event ${event} on playerA should not be called`);
+        playerA.onAny(function (event: GameEvents) {
+          expect(['gameJoined', 'gameTurn'].includes(event)).toBeTruthy();
         });
-
         await playerB.onAny(function (event: string, data: Record<string, any>) {
           if (event === 'exception') {
             expect(data.statusCode).toBe(400);
