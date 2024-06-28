@@ -4,7 +4,7 @@ import * as request from 'supertest';
 import { AppModule } from '../src/app.module';
 import { io, Socket } from 'socket.io-client';
 import { faker } from '@faker-js/faker';
-import { GameGateway } from '../src/game/game.gateway';
+import { GameEvents, GameGateway } from '../src/game/game.gateway';
 import { GameService } from '../src/game/game.service';
 import { ESymbol } from '../src/game/dtos/maze.dto';
 
@@ -15,6 +15,8 @@ describe('GameModule (e2e)', () => {
   let playerB: Socket;
   let gameId: string;
   let gateway: GameGateway;
+
+  const connectToSocket = (gameId?: string) => io(`http://localhost:3000/game?gameId=${gameId || ''}`);
 
   beforeAll(async () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -28,19 +30,21 @@ describe('GameModule (e2e)', () => {
     await app.listen(3000);
   });
 
-  beforeEach(function (done) {
-    if (expect.getState().currentTestName?.match(/GameController/)) {
-      return done();
+  beforeEach(async function () {
+    const matches = [/should create game on connect without gameId/, /GameController/];
+    const testName = expect.getState().currentTestName;
+
+    if (testName && matches.some((match) => match.test(testName))) {
+      return;
     }
-    playerA = io('http://localhost:3000/game');
-    playerA.on('gameCreated', function (data) {
-      expect(data).toBeInstanceOf(Object);
-      expect(typeof data.gameId).toBe('string');
-      expect(data.gameId.length).toBeGreaterThan(0);
 
-      gameId = data.gameId;
+    playerA = connectToSocket();
 
-      done();
+    await new Promise<void>((resolve) => {
+      playerA.on('gameCreated', function (data) {
+        gameId = data.gameId;
+        resolve();
+      });
     });
   });
 
@@ -66,18 +70,38 @@ describe('GameModule (e2e)', () => {
   describe('Socket.io Connection', () => {
     it('should create game on connect without gameId', () => {
       return new Promise<void>(async (resolve, reject) => {
-        expect(gameId).toBeTruthy();
+        playerA = connectToSocket();
 
-        playerA.on('gameJoined', (data) => {
-          expect(data).toBeInstanceOf(Object);
-          expect(data).toHaveProperty('playerId');
-          expect(data.playerId).toBe(playerA.id);
-        });
+        await new Promise<void>((resolve, reject) => {
+          let step = 0;
+          playerA.onAny(async (event: GameEvents, data: Record<string, any>) => {
+            try {
+              switch (event) {
+                case 'gameCreated':
+                  expect(data).toBeInstanceOf(Object);
+                  expect(data).toHaveProperty('gameId');
+                  expect(data.gameId.length).toBeGreaterThan(0);
+                  gameId = data.gameId;
+                  step++;
+                  break;
+                case 'gameJoined':
+                case 'gameTurn':
+                  expect(data).toBeInstanceOf(Object);
+                  expect(data).toHaveProperty('playerId');
+                  expect(data.playerId).toBe(playerA.id);
+                  step++;
+                  break;
+                default:
+                  throw new Error(`Event ${event} is not expected.`);
+              }
 
-        playerA.on('gameTurn', (data) => {
-          expect(data).toBeInstanceOf(Object);
-          expect(data).toHaveProperty('playerId');
-          expect(data.playerId).toBe(playerA.id);
+              if (step === 3) {
+                return resolve();
+              }
+            } catch (e) {
+              return reject(e);
+            }
+          });
         });
 
         await request(app.getHttpServer())
@@ -102,80 +126,63 @@ describe('GameModule (e2e)', () => {
 
     it('should return exception and disconnect on invalid', () => {
       return new Promise<void>((resolve, reject) => {
-        const errorGameId = faker.lorem.slug();
-        playerB = io(`http://localhost:3000/game?gameId=${errorGameId}`);
+        playerB = connectToSocket('0');
 
         playerB.on('disconnect', (reason) => {
-          playerB.removeAllListeners();
-          playerB = undefined;
-          expect(reason).toBe('io server disconnect');
-          resolve();
+          try {
+            expect(reason).toBe('io server disconnect');
+            resolve();
+          } catch (e) {
+            reject(e);
+          }
         });
-
-        playerB.on('exception', (error) => {
-          expect(error).toBeInstanceOf(Object);
-          expect(error.message).toBe(`Game ${errorGameId} not found`);
-          expect(error.error).toBe('Not Found');
-          expect(error.statusCode).toBe(404);
-        });
-
-        playerB.on('gameCreated', () => {
-          reject(new Error('gameCreated event fired'));
-        });
-
-        playerB.on('gameTurn', () => {
-          reject(new Error('gameTurn event fired'));
-        });
-
-        playerB.on('gameJoined', () => {
-          reject(new Error('gameJoined event fired'));
+        playerB.onAny((event: string, data: Record<string, any>) => {
+          try {
+            expect(event).toBe('exception');
+            expect(data).toBeInstanceOf(Object);
+            expect(data.message).toBe('Game 0 not found');
+            expect(data.error).toBe('Not Found');
+            expect(data.statusCode).toBe(404);
+          } catch (e) {
+            reject(e);
+          }
         });
       });
     });
 
     it('should join game on valid gameId', () => {
-      return new Promise<void>((resolve, reject) => {
-        playerB = io(`http://localhost:3000/game?gameId=${gameId}`);
-
-        const checks = {
-          isConnected: false,
-          hasEmittedGameJoined: false,
-          hasEmittedGameTurn: false,
-        };
-
-        playerB.on('connect', () => {
-          checks.isConnected = true;
+      return new Promise<void>(async (resolve, reject) => {
+        playerB = connectToSocket(gameId);
+        playerB.on('disconnect', () => {
+          reject('playerB socket disconnected');
         });
 
-        playerB.on('disconnect', (reason) => {
-          reject(new Error(`Disconnected with ${reason}`));
-        });
-        playerB.on('exception', (error) => {
-          reject(new Error(error.message));
-        });
-        playerB.on('gameCreated', () => {
-          reject(new Error('gameCreated event fired'));
+        await new Promise<void>((resolve) => {
+          let step = 0;
+          playerB.onAny((event: GameEvents, data: Record<string, any>) => {
+            try {
+              switch (event) {
+                case 'gameJoined':
+                case 'gameTurn':
+                  expect(data).toBeInstanceOf(Object);
+                  expect(data).toHaveProperty('playerId');
+                  expect(data.playerId).toBe(event === 'gameJoined' ? playerB.id : playerA.id);
+                  step++;
+                  break;
+                default:
+                  throw new Error(`Event ${event} is not expected.`);
+              }
+
+              if (step === 2) {
+                resolve();
+              }
+            } catch (e) {
+              reject(e);
+            }
+          });
         });
 
-        playerB.on('gameTurn', (data) => {
-          expect(data).toHaveProperty('playerId');
-          expect(data.playerId).toBe(playerA.id);
-          checks.hasEmittedGameTurn = true;
-        });
-
-        playerB.on('gameJoined', (data) => {
-          expect(data).toHaveProperty('playerId');
-          expect(data.playerId).toBe(playerB.id);
-          checks.hasEmittedGameJoined = true;
-        });
-
-        const timer = setInterval(() => {
-          if (Object.values(checks).every((check) => check)) {
-            clearInterval(timer);
-            resolve();
-            playerB.removeAllListeners();
-          }
-        }, 50);
+        resolve();
       });
     });
   });
@@ -185,7 +192,7 @@ describe('GameModule (e2e)', () => {
       return new Promise<void>((resolve) => {
         const errorGameId = faker.lorem.slug();
 
-        playerA.onAny(function (event: string, data: Record<string, any>) {
+        playerA.onAny(function (event: GameEvents, data: Record<string, any>) {
           expect(event).toBe('exception');
           expect(data.statusCode).toBe(404);
           expect(data.message).toBe(`Game ${errorGameId} not found`);
@@ -203,7 +210,7 @@ describe('GameModule (e2e)', () => {
 
     it('should throw error when playerA tries to mark maze without playerB joins', () => {
       return new Promise<void>((resolve) => {
-        playerA.onAny(function (event: string, data: Record<string, any>) {
+        playerA.onAny(function (event: GameEvents, data: Record<string, any>) {
           expect(event).toBe('exception');
           expect(data.statusCode).toBe(400);
           expect(data.message).toBeInstanceOf(Array);
@@ -224,7 +231,7 @@ describe('GameModule (e2e)', () => {
       return new Promise<void>((resolve) => {
         playerB = io(`http://localhost:3000/game?gameId=${gameId}`);
 
-        playerA.onAny(function (event: string, data: Record<string, any>) {
+        playerA.onAny(function (event: GameEvents, data: Record<string, any>) {
           if (event === 'exception') {
             expect(data.statusCode).toBe(400);
             expect(data.message).toBeInstanceOf(Array);
@@ -249,10 +256,6 @@ describe('GameModule (e2e)', () => {
     it('should throw exception when player without its turn tries to mark on maze', () => {
       return new Promise<void>(async (resolve, reject) => {
         playerB = io(`http://localhost:3000/game?gameId=${gameId}`);
-
-        await new Promise<void>((resolve) => {
-          playerB.on('connect', () => resolve());
-        });
 
         playerA.onAny(function (event: string) {
           reject(`Event ${event} on playerA should not be called`);
