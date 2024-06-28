@@ -20,6 +20,8 @@ import { GameMazeDto } from './dtos/game-maze-ws.dto';
 import { WsGatewayExceptionFilter } from './filters/ws-gateway-exception.filter';
 import { GameDto } from './dtos/game.dto';
 
+export type GameEvents = 'gameCreated' | 'gameMazeMarked' | 'gameTurn' | 'gameStats' | 'gameJoined' | 'exception';
+
 @WebSocketGateway({ namespace: 'game', cors: { origin: true } })
 export class GameGateway implements OnGatewayConnection {
   private readonly logger = new ConsoleLogger(GameGateway.name, {
