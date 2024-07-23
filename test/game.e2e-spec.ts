@@ -4,12 +4,19 @@ import * as request from 'supertest';
 import { AppModule } from '../src/app.module';
 import { io, Socket } from 'socket.io-client';
 import { faker } from '@faker-js/faker';
+import { GameEvents, GameGateway } from '../src/game/game.gateway';
+import { GameService } from '../src/game/game.service';
+import { ESymbol } from '../src/game/dtos/maze.dto';
 
 describe('GameModule (e2e)', () => {
   let app: INestApplication;
+  let service: GameService;
   let playerA: Socket;
   let playerB: Socket;
   let gameId: string;
+  let gateway: GameGateway;
+
+  const connectToSocket = (gameId?: string) => io(`http://localhost:3000/game?gameId=${gameId || ''}`);
 
   beforeAll(async () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -17,8 +24,28 @@ describe('GameModule (e2e)', () => {
     }).compile();
 
     app = moduleFixture.createNestApplication();
+    gateway = moduleFixture.get<GameGateway>(GameGateway);
+    service = moduleFixture.get<GameService>(GameService);
     await app.init();
     await app.listen(3000);
+  });
+
+  beforeEach(async function () {
+    const matches = [/should create game on connect without gameId/, /GameController/];
+    const testName = expect.getState().currentTestName;
+
+    if (testName && matches.some((match) => match.test(testName))) {
+      return;
+    }
+
+    playerA = connectToSocket();
+
+    await new Promise<void>((resolve) => {
+      playerA.on('gameCreated', function (data) {
+        gameId = data.gameId;
+        resolve();
+      });
+    });
   });
 
   describe('GameController', () => {
@@ -42,196 +69,326 @@ describe('GameModule (e2e)', () => {
 
   describe('Socket.io Connection', () => {
     it('should create game on connect without gameId', () => {
-      return new Promise<void>((resolve, reject) => {
-        playerA = io('http://localhost:3000/game');
-        const checks = {
-          isConnected: false,
-          isValidGame: false,
-          hasEmittedGameCreated: false,
-          hasEmittedGameJoined: false,
-          hasEmittedGameTurn: false,
-          hasNoException: true,
-        };
-        playerA.on('connect', () => {
-          checks.isConnected = true;
-        });
+      return new Promise<void>(async (resolve, reject) => {
+        playerA = connectToSocket();
 
-        playerA.on('exception', (error) => {
-          checks.hasNoException = false;
-          reject(error);
-        });
-
-        playerA.on('gameJoined', (data) => {
-          try {
-            expect(data).toBeInstanceOf(Object);
-            expect(data).toHaveProperty('playerId');
-            expect(data.playerId).toBe(playerA.id);
-            checks.hasEmittedGameJoined = true;
-          } catch (error) {
-            reject(error);
-          }
-        });
-
-        playerA.on('gameTurn', (data) => {
-          try {
-            expect(data).toBeInstanceOf(Object);
-            expect(data).toHaveProperty('playerId');
-            expect(data.playerId).toBe(playerA.id);
-            checks.hasEmittedGameTurn = true;
-          } catch (error) {
-            reject(error);
-          }
-        });
-
-        playerA.on('gameCreated', (data) => {
-          Promise.all([
-            expect(data).toBeInstanceOf(Object),
-            expect(data).toHaveProperty('gameId'),
-            request(app.getHttpServer())
-              .get('/games')
-              .expect(200)
-              .expect('Content-Type', /^application\/json/)
-              .expect((response) => {
-                try {
-                  expect(response.body[0].uid).toBe(data.gameId);
-                  expect(response.body[0].players).toHaveLength(1);
-                  expect(response.body[0].maze).toHaveLength(9);
-                  expect(response.body[0].currentPlayer).toBe(response.body[0].players[0]);
-                  expect(response.body[0].currentPlayer).toBe(playerA.id);
-
-                  checks.isValidGame = true;
-                  checks.hasEmittedGameCreated = true;
+        await new Promise<void>((resolve, reject) => {
+          let step = 0;
+          playerA.onAny(async (event: GameEvents, data: Record<string, any>) => {
+            try {
+              switch (event) {
+                case 'gameCreated':
+                  expect(data).toBeInstanceOf(Object);
+                  expect(data).toHaveProperty('gameId');
+                  expect(data.gameId.length).toBeGreaterThan(0);
                   gameId = data.gameId;
-                } catch (error) {
-                  reject(error);
-                }
-              }),
-          ]);
+                  step++;
+                  break;
+                case 'gameJoined':
+                case 'gameTurn':
+                  expect(data).toBeInstanceOf(Object);
+                  expect(data).toHaveProperty('playerId');
+                  expect(data.playerId).toBe(playerA.id);
+                  step++;
+                  break;
+                default:
+                  throw new Error(`Event ${event} is not expected.`);
+              }
+
+              if (step === 3) {
+                return resolve();
+              }
+            } catch (e) {
+              return reject(e);
+            }
+          });
         });
 
-        const timer = setInterval(() => {
-          if (Object.values(checks).every((entry) => entry)) {
-            clearInterval(timer);
-            resolve();
-            playerA.removeAllListeners();
-          }
-        }, 50);
+        await request(app.getHttpServer())
+          .get('/games')
+          .expect(200)
+          .expect('Content-Type', /^application\/json/)
+          .expect((response) => {
+            try {
+              expect(response.body[0].uid).toBe(gameId);
+              expect(response.body[0].players).toHaveLength(1);
+              expect(response.body[0].maze).toHaveLength(9);
+              expect(response.body[0].currentPlayer).toBe(response.body[0].players[0]);
+              expect(response.body[0].currentPlayer).toBe(playerA.id);
+            } catch (error) {
+              reject(error);
+            }
+          });
+
+        resolve();
       });
     });
 
     it('should return exception and disconnect on invalid', () => {
       return new Promise<void>((resolve, reject) => {
-        const errorGameId = faker.lorem.slug();
-        playerB = io(`http://localhost:3000/game?gameId=${errorGameId}`);
+        playerB = connectToSocket('0');
 
         playerB.on('disconnect', (reason) => {
-          playerB.removeAllListeners();
-          playerB = undefined;
-          expect(reason).toBe('io server disconnect');
-          resolve();
+          try {
+            expect(reason).toBe('io server disconnect');
+            resolve();
+          } catch (e) {
+            reject(e);
+          }
         });
-
-        playerB.on('exception', (error) => {
-          expect(error).toBeInstanceOf(Object);
-          expect(error.message).toBe(`Game ${errorGameId} not found`);
-          expect(error.error).toBe('Not Found');
-          expect(error.statusCode).toBe(404);
-        });
-
-        playerB.on('gameCreated', () => {
-          reject(new Error('gameCreated event fired'));
-        });
-
-        playerB.on('gameTurn', () => {
-          reject(new Error('gameTurn event fired'));
-        });
-
-        playerB.on('gameJoined', () => {
-          reject(new Error('gameJoined event fired'));
+        playerB.onAny((event: string, data: Record<string, any>) => {
+          try {
+            expect(event).toBe('exception');
+            expect(data).toBeInstanceOf(Object);
+            expect(data.message).toBe('Game 0 not found');
+            expect(data.error).toBe('Not Found');
+            expect(data.statusCode).toBe(404);
+          } catch (e) {
+            reject(e);
+          }
         });
       });
     });
 
     it('should join game on valid gameId', () => {
-      return new Promise<void>((resolve, reject) => {
-        playerB = io(`http://localhost:3000/game?gameId=${gameId}`);
-
-        const checks = {
-          isConnected: false,
-          hasEmittedGameJoined: false,
-          hasEmittedGameTurn: false,
-        };
-
-        playerB.on('connect', () => {
-          checks.isConnected = true;
+      return new Promise<void>(async (resolve, reject) => {
+        playerB = connectToSocket(gameId);
+        playerB.on('disconnect', () => {
+          reject('playerB socket disconnected');
         });
 
-        playerB.on('disconnect', (reason) => {
-          reject(new Error(`Disconnected with ${reason}`));
-        });
-        playerB.on('exception', (error) => {
-          reject(new Error(error.message));
-        });
-        playerB.on('gameCreated', () => {
-          reject(new Error('gameCreated event fired'));
+        await new Promise<void>((resolve) => {
+          let step = 0;
+          playerB.onAny((event: GameEvents, data: Record<string, any>) => {
+            try {
+              switch (event) {
+                case 'gameJoined':
+                case 'gameTurn':
+                  expect(data).toBeInstanceOf(Object);
+                  expect(data).toHaveProperty('playerId');
+                  expect(data.playerId).toBe(event === 'gameJoined' ? playerB.id : playerA.id);
+                  step++;
+                  break;
+                default:
+                  throw new Error(`Event ${event} is not expected.`);
+              }
+
+              if (step === 2) {
+                resolve();
+              }
+            } catch (e) {
+              reject(e);
+            }
+          });
         });
 
-        playerB.on('gameTurn', (data) => {
-          expect(data).toHaveProperty('playerId');
-          expect(data.playerId).toBe(playerA.id);
-          checks.hasEmittedGameTurn = true;
-        });
-
-        playerB.on('gameJoined', (data) => {
-          expect(data).toHaveProperty('playerId');
-          expect(data.playerId).toBe(playerB.id);
-          checks.hasEmittedGameJoined = true;
-        });
-
-        const timer = setInterval(() => {
-          if (Object.values(checks).every((check) => check)) {
-            clearInterval(timer);
-            resolve();
-            playerB.removeAllListeners();
-          }
-        }, 50);
+        resolve();
       });
     });
   });
 
   describe('Socket.io Event (gameMazeMark)', () => {
     it('should throw errors on invalid gameId', () => {
-      return Promise.reject('TODO');
+      return new Promise<void>((resolve) => {
+        const errorGameId = faker.lorem.slug();
+
+        playerA.onAny(function (event: GameEvents, data: Record<string, any>) {
+          expect(event).toBe('exception');
+          expect(data.statusCode).toBe(404);
+          expect(data.message).toBe(`Game ${errorGameId} not found`);
+          expect(data.error).toBe('Not Found');
+          resolve();
+        });
+
+        playerA.emit('gameMazeMark', {
+          gameId: errorGameId,
+          colId: 1,
+          rowId: 1,
+        });
+      });
+    });
+
+    it('should throw error when playerA tries to mark maze without playerB joins', () => {
+      return new Promise<void>((resolve) => {
+        playerA.onAny(function (event: GameEvents, data: Record<string, any>) {
+          expect(event).toBe('exception');
+          expect(data.statusCode).toBe(400);
+          expect(data.message).toBeInstanceOf(Array);
+          expect(data.message[0]).toBe('Please wait for your opponent to join.');
+          expect(data.error).toBe('Bad Request');
+          resolve();
+        });
+
+        playerA.emit('gameMazeMark', {
+          gameId,
+          colId: 1,
+          rowId: 1,
+        });
+      });
     });
 
     it('should throw errors on invalid maze grid numbers', () => {
-      return Promise.reject('TODO');
+      return new Promise<void>((resolve) => {
+        playerB = io(`http://localhost:3000/game?gameId=${gameId}`);
+
+        playerA.onAny(function (event: GameEvents, data: Record<string, any>) {
+          if (event === 'exception') {
+            expect(data.statusCode).toBe(400);
+            expect(data.message).toBeInstanceOf(Array);
+            expect(data.message).toHaveLength(2);
+            expect(data.message).toEqual(['rowId must not be greater than 3', 'colId must not be greater than 3']);
+            expect(data.error).toBe('Bad Request');
+            resolve();
+          }
+        });
+
+        const colId = faker.number.int({ min: 4, max: 10 });
+        const rowId = faker.number.int({ min: 4, max: 10 });
+
+        playerA.emit('gameMazeMark', {
+          gameId,
+          colId,
+          rowId,
+        });
+      });
     });
 
     it('should throw exception when player without its turn tries to mark on maze', () => {
-      return Promise.reject('TODO');
-    });
+      return new Promise<void>(async (resolve) => {
+        playerB = io(`http://localhost:3000/game?gameId=${gameId}`);
+        playerA.onAny(function (event: GameEvents) {
+          expect(['gameJoined', 'gameTurn'].includes(event)).toBeTruthy();
+        });
+        await playerB.onAny(function (event: string, data: Record<string, any>) {
+          if (event === 'exception') {
+            expect(data.statusCode).toBe(400);
+            expect(data.message).toBeInstanceOf(Array);
+            expect(data.message[0]).toEqual('Please wait for your turn.');
+            expect(data.error).toBe('Bad Request');
+            resolve();
+          }
+        });
 
-    it('should mark maze if symbol is Empty', () => {
-      return Promise.reject('TODO');
+        playerB.emit('gameMazeMark', {
+          gameId,
+          colId: 1,
+          rowId: 2,
+        });
+      });
     });
 
     it('should throw exception if position already marked', () => {
-      return Promise.reject('TODO');
+      return new Promise<void>(async (resolve) => {
+        playerB = io(`http://localhost:3000/game?gameId=${gameId}`);
+
+        await new Promise<void>((resolve) => {
+          playerB.on('connect', () => resolve());
+        });
+
+        playerA.emit('gameMazeMark', {
+          gameId,
+          colId: 1,
+          rowId: 1,
+        });
+
+        playerB.onAny((event: string, data: Record<string, any>) => {
+          if (event === 'exception') {
+            expect(service.getGameById(gameId).currentPlayer).toBe(playerB.id);
+            expect(data.statusCode).toBe(400);
+            expect(data.message).toBeInstanceOf(Array);
+            expect(data.message[0]).toEqual('This entry is already marked. Choose another location.');
+            expect(data.error).toBe('Bad Request');
+            resolve();
+          }
+        });
+
+        playerB.emit('gameMazeMark', {
+          gameId,
+          colId: 1,
+          rowId: 1,
+        });
+      });
     });
 
     it('should set isEnded when isWinner is set', () => {
-      return Promise.reject('TODO');
+      return new Promise<void>(async (resolve) => {
+        playerB = io(`http://localhost:3000/game?gameId=${gameId}`);
+
+        await new Promise<void>((resolve) => {
+          playerB.on('connect', () => resolve());
+        });
+
+        const game = service.getGameById(gameId);
+        game.maze.find((v) => v.colId == 1 && v.rowId == 1).mark(ESymbol.Cross);
+        game.maze.find((v) => v.colId == 2 && v.rowId == 1).mark(ESymbol.Cross);
+
+        playerB.onAny((event: string, data: Record<string, any>) => {
+          if (event === 'gameStats') {
+            expect(data).toEqual({ winner: playerA.id, isEnded: true, isDraw: false });
+            resolve();
+          }
+        });
+
+        playerA.emit('gameMazeMark', {
+          gameId,
+          colId: 3,
+          rowId: 1,
+        });
+      });
     });
 
     it('should not allow marking on maze when game is ended', () => {
-      return Promise.reject('TODO');
+      return new Promise<void>(async (resolve) => {
+        playerB = io(`http://localhost:3000/game?gameId=${gameId}`);
+
+        await new Promise<void>((resolve) => {
+          playerB.on('connect', () => resolve());
+        });
+
+        const game = service.getGameById(gameId);
+        game.maze.find((v) => v.colId == 1 && v.rowId == 1).mark(ESymbol.Cross);
+        game.maze.find((v) => v.colId == 2 && v.rowId == 1).mark(ESymbol.Cross);
+
+        playerA.emit('gameMazeMark', {
+          gameId,
+          colId: 3,
+          rowId: 1,
+        });
+
+        await new Promise<void>((resolve) => {
+          playerB.onAny((event: string, data: Record<string, any>) => {
+            if (event === 'gameStats' && data.isEnded) {
+              resolve();
+            }
+          });
+        });
+
+        playerA.onAny((event: string, data: Record<string, any>) => {
+          expect(event).toBe('exception');
+          expect(data).toBeInstanceOf(Object);
+          expect(data.statusCode).toBe(400);
+          expect(data.error).toBe('Bad Request');
+          expect(data.message).toBeInstanceOf(Array);
+          expect(data.message[0]).toBe('Game is already ended.');
+          resolve();
+        });
+
+        playerA.emit('gameMazeMark', {
+          gameId,
+          colId: 3,
+          rowId: 1,
+        });
+      });
     });
   });
 
-  afterAll(async () => {
-    playerA && playerA.connected && playerA.disconnect();
-    playerB && playerB.connected && playerB.disconnect();
+  afterEach(function () {
+    playerA?.close();
+    playerB?.close();
+  });
+
+  afterAll(async function () {
+    await gateway.closeAllSockets();
     await app.close();
   });
 });
