@@ -19,7 +19,7 @@ jobs:
         with:
           node-version: 20.15.1
           cache: pnpm
-      - run: pnpm insitall --frozen-lockfile --prod
+      - run: pnpm install --frozen-lockfile --prod
       - run: pnpm build -t webpack
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
